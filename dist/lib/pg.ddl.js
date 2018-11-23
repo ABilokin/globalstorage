@@ -1,0 +1,609 @@
+'use strict';
+
+function _slicedToArray(arr, i) { return _arrayWithHoles(arr) || _iterableToArrayLimit(arr, i) || _nonIterableRest(); }
+
+function _nonIterableRest() { throw new TypeError("Invalid attempt to destructure non-iterable instance"); }
+
+function _iterableToArrayLimit(arr, i) { var _arr = []; var _n = true; var _d = false; var _e = undefined; try { for (var _i = arr[Symbol.iterator](), _s; !(_n = (_s = _i.next()).done); _n = true) { _arr.push(_s.value); if (i && _arr.length === i) break; } } catch (err) { _d = true; _e = err; } finally { try { if (!_n && _i["return"] != null) _i["return"](); } finally { if (_d) throw _e; } } return _arr; }
+
+function _arrayWithHoles(arr) { if (Array.isArray(arr)) return arr; }
+
+var _require = require('@metarhia/common'),
+    iter = _require.iter;
+
+var _require2 = require('./pg.utils'),
+    escapeString = _require2.escapeString,
+    escapeIdentifier = _require2.escapeIdentifier,
+    validateIdentifier = _require2.validateIdentifier,
+    PREDEFINED_DOMAINS = _require2.PREDEFINED_DOMAINS,
+    IGNORED_DOMAINS = _require2.IGNORED_DOMAINS,
+    classMapping = _require2.classMapping;
+
+var _require3 = require('./schema.utils'),
+    extractDecorator = _require3.extractDecorator,
+    getCategoryType = _require3.getCategoryType,
+    isGlobalCategory = _require3.isGlobalCategory,
+    isLocalCategory = _require3.isLocalCategory;
+
+var pad = function pad(name, length) {
+  var symbol = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : ' ';
+  return name + symbol.repeat(length - name.length);
+};
+
+var padProperty = function padProperty(name, length) {
+  return pad("\"".concat(name, "\""), length + 2);
+};
+
+var verticalPad = function verticalPad(text) {
+  return text ? "\n\n".concat(text) : '';
+};
+
+var createComment = function createComment(string) {
+  var separator = "-- ".concat(string, " ");
+  return '\n' + pad(separator, 80, '-') + '\n\n';
+}; // Generates SQL to define an Enum
+//   domainName - string
+//   values - array, array of values of an Enum
+// Returns: string
+
+
+var createEnum = function createEnum(domainName, values) {
+  validateIdentifier(domainName, 'enum');
+  var type = escapeIdentifier(domainName);
+  var sql = createComment("Enum: ".concat(type)) + "CREATE TYPE ".concat(type, " AS ENUM (\n") + "  ".concat(values.map(escapeString).join(',\n  '), "\n);");
+  return {
+    type: type,
+    sql: sql
+  };
+};
+
+var typeFromDomain = {
+  number: function number(domain) {
+    return domain.floating ? 'double precision' : 'bigint';
+  },
+  string: function string() {
+    return 'text';
+  },
+  function: function _function() {
+    return 'text';
+  },
+  boolean: function boolean() {
+    return 'boolean';
+  },
+  object: function object(domain, domainKind) {
+    var type = classMapping[domain.class];
+
+    if (!type) {
+      throw new Error("Unsupported domain class '".concat(domain.class, "' in domain '").concat(domainKind, "'"));
+    }
+
+    return type;
+  }
+}; // Generates SQL to define a domain
+//   domainName - string
+//   domain - object
+// Returns: string
+
+var generateType = function generateType(domainName, domain) {
+  var domainKind = extractDecorator(domain);
+
+  if (domainKind === 'Object') {
+    var type = PREDEFINED_DOMAINS[domainName] || typeFromDomain[domain.type](domain, domainName);
+    return {
+      type: type
+    };
+  }
+
+  if (domainKind === 'Enum') {
+    return createEnum(domainName, domain.values);
+  }
+
+  if (domainKind === 'Flags') {
+    if (domain.values.length <= 16) {
+      return {
+        type: 'smallint'
+      };
+    }
+
+    if (domain.values.length <= 32) {
+      return {
+        type: 'integer'
+      };
+    }
+
+    if (domain.values.length <= 64) {
+      return {
+        type: 'bigint'
+      };
+    }
+
+    throw new Error("Too many flags in ".concat(domainName, ", must not be bigger than 64"));
+  }
+
+  throw new Error("Unsupported domain: ".concat(domainName));
+}; // Generates Map of domain name to SQL definition of that domain
+//   domains - Map, Map of domain definitions
+// Returns: Map, domain -> SQL type definition
+
+
+var generateTypes = function generateTypes(domains) {
+  var sqlQueries = [];
+  var types = iter(domains).filter(function (_ref) {
+    var _ref2 = _slicedToArray(_ref, 1),
+        domainName = _ref2[0];
+
+    return !IGNORED_DOMAINS.includes(domainName);
+  }).map(function (_ref3) {
+    var _ref4 = _slicedToArray(_ref3, 2),
+        domainName = _ref4[0],
+        domain = _ref4[1];
+
+    var _generateType = generateType(domainName, domain),
+        type = _generateType.type,
+        sql = _generateType.sql;
+
+    if (sql) {
+      sqlQueries.push(sql);
+    }
+
+    return [domainName, type];
+  }).collectTo(Map);
+  return {
+    types: types,
+    typesSQL: sqlQueries.join('\n')
+  };
+}; // Determines if a property should have a FOREIGN KEY constraint
+//   categories - Map, categories generated by metaschema
+//   from - string, name of a source category
+// Returns: boolean
+
+
+var requiresForeignKey = function requiresForeignKey(categories, from) {
+  return isLocalCategory(categories.get(from).definition);
+}; // Categorizes schema entries into indexes, unique, links, and properties
+//   category - object, category definition
+//   categoryName - string, name of a category
+//   categories - Map, categories generated by metaschema
+// Returns: {
+//   indexes - array, array of { name, property }
+//   unique - array, array of { name, property }
+//   links - array, array of { name, property, required }
+//   properties - array, array of { name, property }
+// }
+
+
+var categorizeEntries = function categorizeEntries(category, categoryName, categories) {
+  var indexes = [];
+  var unique = [];
+  var links = [];
+  var properties = [];
+  iter(Object.keys(category)).filter(function (name) {
+    return typeof category[name] !== 'function';
+  }).each(function (name) {
+    validateIdentifier(name, 'entry', "".concat(categoryName, "."));
+    var property = category[name];
+    var type = extractDecorator(property);
+
+    if (type === 'Include') {
+      return;
+    }
+
+    var entry = {
+      name: name,
+      property: property
+    };
+
+    if (property.index) {
+      indexes.push(entry);
+    } else if (property.unique) {
+      unique.push(entry);
+    }
+
+    if (property.domain) {
+      properties.push(entry);
+    } else if (property.category) {
+      entry.foreignKey = requiresForeignKey(categories, categoryName);
+      entry.destination = isGlobalCategory(property.definition) ? 'Identifier' : property.category;
+
+      if (type !== 'Many') {
+        if (type !== 'Object') {
+          entry.property.required = type === 'Master';
+        }
+
+        properties.push(entry);
+      }
+
+      if (type === 'Many' || entry.foreignKey) {
+        links.push(entry);
+      }
+    } else if (type === 'Index') {
+      indexes.push(entry);
+    } else if (type === 'Unique') {
+      unique.push(entry);
+    }
+  });
+  return {
+    indexes: indexes,
+    unique: unique,
+    links: links,
+    properties: properties
+  };
+}; // Calculates max length of properties in a category
+//   properties - array, array of { name, property }
+// Returns: number
+
+
+var getMaxPropLength = function getMaxPropLength(properties) {
+  return iter(properties).map(function (property) {
+    return property.name.length;
+  }).reduce(Math.max);
+}; // Generates SQL to define properties in a table
+//   category - string, category name
+//   properties - array, array of properties in a category
+//   types - Map, domain -> SQL type definition
+//   maxPropLength - number, length of properties to be padded to
+// Returns: string
+
+
+var generateProperties = function generateProperties(category, properties, types, maxPropLength) {
+  return properties.map(function (_ref5) {
+    var name = _ref5.name,
+        property = _ref5.property;
+    var type = property.domain ? types.get(property.domain) : 'bigint';
+    var sql = "".concat(padProperty(name, maxPropLength), " ").concat(type);
+
+    if (property.required) {
+      sql += ' NOT NULL';
+    }
+
+    if (property.default !== undefined) {
+      sql += " DEFAULT ".concat(escapeString(property.default.toString()));
+    }
+
+    return sql;
+  });
+}; // Generates SQL to define a link in a table
+//   from - string, name of a source category
+//   to - string, name of a destination category
+//   name - string, name of a link
+//   type - string, type of link
+//   destination - string, name of a table to create `FOREIGN KEY` to
+// Returns: string
+
+
+var generateLink = function generateLink(from, to, name, type, destination) {
+  var constraint = "fk".concat(from).concat(name);
+  validateIdentifier(constraint, 'constraint');
+  var sql = "ALTER TABLE ".concat(escapeIdentifier(from), " ") + "ADD CONSTRAINT ".concat(escapeIdentifier(constraint), " ") + "FOREIGN KEY (".concat(escapeIdentifier(name), ") ");
+  sql += "REFERENCES \"".concat(destination, "\" (").concat(escapeIdentifier('Id'), ") ") + 'ON UPDATE RESTRICT ON DELETE ';
+
+  if (type === 'Object') {
+    sql += 'RESTRICT';
+  } else if (type === 'Master') {
+    sql += 'CASCADE';
+  } else {
+    throw new Error("".concat(type, " decorator is not supported"));
+  }
+
+  return sql + ';';
+}; // Generates SQL to define many to many relationship
+//   from - string, name of a source category
+//   to - string, name of a destination category
+//   name - string, name of a link
+//   categories - Map, categories generated by metaschema
+//   destination - string, name of a table to create the link to
+// Returns: string
+
+
+var generateManyToMany = function generateManyToMany(from, to, name, categories, destination) {
+  var propLength = from.length > to.length ? from.length : to.length;
+  var tableName = from + name;
+  var table = "\nCREATE TABLE ".concat(escapeIdentifier(tableName), " (\n") + "  ".concat(padProperty(from, propLength), " bigint NOT NULL,\n") + "  ".concat(padProperty(to, propLength), " bigint NOT NULL\n);");
+  var lines = [table];
+
+  if (requiresForeignKey(categories, from)) {
+    lines.push(generateLink(tableName, from, from, 'Master', from));
+    lines.push(generateLink(tableName, to, to, 'Master', destination));
+  }
+
+  var primary = "pk".concat(name).concat(from).concat(to);
+  validateIdentifier(primary, 'constraint');
+  lines.push("ALTER TABLE ".concat(escapeIdentifier(tableName), " ") + "ADD CONSTRAINT ".concat(escapeIdentifier(primary), " ") + "PRIMARY KEY (".concat(escapeIdentifier(from), ", ").concat(escapeIdentifier(to), ");"));
+  return lines.join('\n');
+}; // Generates SQL to define links in a table
+//   links - array, array of links
+//   categories - Map, categories generated by metaschema
+// Returns: string
+
+
+var generateLinks = function generateLinks(links, categories) {
+  return links.sort(function (_ref6) {
+    var link = _ref6.link;
+    return extractDecorator(link) === 'Many';
+  }).map(function (_ref7) {
+    var from = _ref7.from,
+        to = _ref7.to,
+        name = _ref7.name,
+        link = _ref7.link,
+        destination = _ref7.destination;
+    var type = extractDecorator(link);
+    return type === 'Many' ? generateManyToMany(from, to, name, categories, destination) : generateLink(from, to, name, type, destination);
+  }).join('\n');
+}; // Generates SQL to define indexes in a table
+//   indexes - array, array of entries that require an index
+//   table - string, name of a table
+// Returns: string
+
+
+var generateIndexes = function generateIndexes(indexes, table) {
+  return indexes.map(function (_ref8) {
+    var name = _ref8.name,
+        index = _ref8.property;
+    var type = extractDecorator(index);
+    var prop = type === 'Index' ? index.fields.map(escapeIdentifier).join(', ') : escapeIdentifier(name);
+    var indexName = "idx".concat(table).concat(name);
+    validateIdentifier(name, 'index');
+    return "CREATE INDEX ".concat(escapeIdentifier(indexName), " ") + "on ".concat(escapeIdentifier(table), " (").concat(prop, ");");
+  }).join('\n');
+}; // Generates SQL to define UNIQUE constraints in a table
+//   unique - array, array of entries that require UNIQUE constraint
+//   table - string, name of a table
+// Returns: string
+
+
+var generateUnique = function generateUnique(unique, table) {
+  return unique.map(function (_ref9) {
+    var name = _ref9.name,
+        index = _ref9.property;
+    var type = extractDecorator(index);
+    var prop = type === 'Unique' ? index.fields.map(escapeIdentifier).join(', ') : escapeIdentifier(name);
+    var constraint = "ak".concat(table).concat(name);
+    validateIdentifier(constraint, 'constraint');
+    return "ALTER TABLE ".concat(escapeIdentifier(table), " ") + "ADD CONSTRAINT ".concat(escapeIdentifier(constraint), " UNIQUE (").concat(prop, ");");
+  }).join('\n');
+}; // Generates SQL to define id in a table
+//   type - string, type of a category
+//   length - length to pad id to
+// Returns: string
+
+
+var generateId = function generateId(type, length) {
+  return padProperty('Id', length) + (type === 'Global' ? ' bigint' : ' bigserial');
+}; // Categorizes links into resolvable and unresolvable.
+//   category - string, name of category to resolve links to and from
+//   unresolvedLinks - Map, Map of unresolved links
+//   links - array, array of links to be categorized
+//   existingTables - array, array of names of defined tables
+// Returns: [
+//   unresolved - array, array of links that can not be resolved at he moment
+//   resolvableLinks - array, array of links that can be resolved
+// ]
+
+
+var getResolvableLinks = function getResolvableLinks(category, unresolvedLinks, links, existingTables) {
+  var resolvableLinks = unresolvedLinks.get(category) || [];
+  var unresolved = links.filter(function (_ref10) {
+    var name = _ref10.name,
+        link = _ref10.property,
+        destination = _ref10.destination;
+
+    if (destination === category || existingTables.includes(destination)) {
+      resolvableLinks.push({
+        from: category,
+        to: link.category,
+        name: name,
+        link: link,
+        destination: destination
+      });
+      return false;
+    }
+
+    return true;
+  });
+  return [unresolved, resolvableLinks];
+}; // Generates SQL to define a table.
+//   name - string, name of a category
+//   category - object, category definition
+//   type - string, type of a category
+//   types - Map, domain -> SQL type definition
+//   unresolvedLinks - Map, Map of unresolved links
+//   existingTables - array, array of names of defined tables
+//   categories - Map, categories generated by metaschema
+// Returns: string
+
+
+var generateTable = function generateTable(name, category, type, types, unresolvedLinks, existingTables, categories) {
+  validateIdentifier(name, 'table');
+
+  var _categorizeEntries = categorizeEntries(category, name, categories),
+      indexes = _categorizeEntries.indexes,
+      unique = _categorizeEntries.unique,
+      links = _categorizeEntries.links,
+      properties = _categorizeEntries.properties;
+
+  var maxPropLength = getMaxPropLength(properties);
+  var props = generateProperties(name, properties, types, maxPropLength);
+  props.unshift(generateId(type, maxPropLength));
+
+  var _getResolvableLinks = getResolvableLinks(name, unresolvedLinks, links, existingTables),
+      _getResolvableLinks2 = _slicedToArray(_getResolvableLinks, 2),
+      unresolved = _getResolvableLinks2[0],
+      resolvableLinks = _getResolvableLinks2[1];
+
+  var pk = "pk".concat(name, "Id");
+  validateIdentifier(pk, 'constraint');
+  var primaryKey = "ALTER TABLE ".concat(escapeIdentifier(name), " ") + "ADD CONSTRAINT ".concat(escapeIdentifier(pk), " ") + "PRIMARY KEY (".concat(escapeIdentifier('Id'), ");");
+  var sql = createComment("Category: ".concat(name)) + "CREATE TABLE ".concat(escapeIdentifier(name), " (\n  ").concat(props.join(',\n  '), "\n);") + [generateIndexes(indexes, name), generateUnique(unique, name), primaryKey, generateLinks(resolvableLinks, categories)].map(verticalPad).join('');
+  return {
+    sql: sql,
+    unresolved: unresolved
+  };
+}; // Adds new unresolved links to an existing map
+//   links - array, array of { name, property, required }
+//   unresolvedLinks - Map, Map of unresolved links: destination
+//   category - string, category name
+
+
+var addUnresolved = function addUnresolved(links, unresolved, category) {
+  links.forEach(function (_ref11) {
+    var name = _ref11.name,
+        link = _ref11.property,
+        destination = _ref11.destination;
+    var existingLinks = unresolved.get(destination);
+    var newLink = {
+      from: category,
+      to: link.category,
+      name: name,
+      link: link,
+      destination: destination
+    };
+
+    if (existingLinks) {
+      existingLinks.push(newLink);
+    } else {
+      unresolved.set(destination, [newLink]);
+    }
+  });
+}; // Generates SQL to define tables based on a schema.
+//   categories - Map, categories generated by metaschema
+//   types - Map, domain -> SQL type definition
+// Returns: string
+
+
+var generateTables = function generateTables(categories, types) {
+  var unresolvedLinks = new Map();
+  /* links: table => [{ name, link }] */
+
+  var existingTables = [];
+  return iter(categories).map(function (_ref12) {
+    var _ref13 = _slicedToArray(_ref12, 2),
+        name = _ref13[0],
+        category = _ref13[1];
+
+    var type = getCategoryType(category.definition);
+    return {
+      name: name,
+      category: category.definition,
+      type: type
+    };
+  }).filter(function (_ref14) {
+    var type = _ref14.type;
+    return type !== 'Ignore';
+  }).map(function (_ref15) {
+    var name = _ref15.name,
+        category = _ref15.category,
+        type = _ref15.type;
+
+    var _generateTable = generateTable(name, category, type, types, unresolvedLinks, existingTables, categories),
+        sql = _generateTable.sql,
+        unresolved = _generateTable.unresolved;
+
+    if (unresolved) {
+      addUnresolved(unresolved, unresolvedLinks, name);
+    }
+
+    existingTables.push(name);
+    return sql;
+  }).toArray().join('\n');
+};
+
+var createHistorySchema = function createHistorySchema(schema, domains, categories) {
+  var history = Object.assign({}, schema);
+  var dateTime = domains.get('DateTime').definition;
+  history._Creation = {
+    domain: 'DateTime',
+    required: true,
+    index: true,
+    definition: dateTime
+  };
+  history._Effective = {
+    domain: 'DateTime',
+    required: true,
+    index: true,
+    definition: dateTime
+  };
+  history._Cancel = {
+    domain: 'DateTime',
+    index: true,
+    definition: dateTime
+  };
+  history._HistoryStatus = {
+    domain: 'HistoryStatus',
+    required: true,
+    definition: dateTime
+  };
+  history._Identifier = {
+    category: 'Identifier',
+    required: true,
+    index: true,
+    definition: categories.get('Identifier').definition
+  };
+  return history;
+};
+
+var preprocessSchema = function preprocessSchema(categories, domains) {
+  var processed = new Map();
+  var _iteratorNormalCompletion = true;
+  var _didIteratorError = false;
+  var _iteratorError = undefined;
+
+  try {
+    for (var _iterator = categories[Symbol.iterator](), _step; !(_iteratorNormalCompletion = (_step = _iterator.next()).done); _iteratorNormalCompletion = true) {
+      var _step$value = _slicedToArray(_step.value, 2),
+          name = _step$value[0],
+          category = _step$value[1];
+
+      processed.set(name, category);
+      var type = extractDecorator(category.definition);
+
+      if (type === 'History') {
+        var historyName = "".concat(name, "History");
+        processed.set(historyName, {
+          name: historyName,
+          definition: createHistorySchema(category.definition, domains, categories)
+        });
+      }
+    }
+  } catch (err) {
+    _didIteratorError = true;
+    _iteratorError = err;
+  } finally {
+    try {
+      if (!_iteratorNormalCompletion && _iterator.return != null) {
+        _iterator.return();
+      }
+    } finally {
+      if (_didIteratorError) {
+        throw _iteratorError;
+      }
+    }
+  }
+
+  return processed;
+}; // Generate SQL to define extensions being used.
+//   names <string[]> extension names
+// Returns: <string>
+
+
+var generateExtensions = function generateExtensions(names) {
+  return names.map(function (extName) {
+    return "CREATE EXTENSION IF NOT EXISTS ".concat(extName, ";\n");
+  }).join('');
+}; // Generates SQL to define a postgres database structure based on a schema.
+//   schema - Metaschema
+// Returns: string
+
+
+var generateDDL = function generateDDL(schema) {
+  var _generateTypes = generateTypes(schema.domains),
+      types = _generateTypes.types,
+      typesSQL = _generateTypes.typesSQL;
+
+  var extensionsSQL = generateExtensions(['pgcrypto']);
+  var tablesSQL = generateTables(preprocessSchema(schema.categories, schema.domains), types);
+  return "".concat(extensionsSQL, "\n").concat(typesSQL, "\n").concat(tablesSQL);
+};
+
+module.exports = {
+  generateDDL: generateDDL
+};
