@@ -38,6 +38,7 @@
     "test": "npm run lint && metatests test/",
     "lint": "eslint . --ignore-path .gitignore && prettier -c \"**/*.js\" \"**/*.json\" \"**/*.md\" \".*rc\" \"**/*.yml\"",
     "fmt": "prettier --write \"**/*.js\" \"**/*.json\" \"**/*.md\" \".*rc\" \"**/*.yml\"",
+    "doc": "metadoc -c",
     "build": "babel gs.js -d dist && babel lib -d dist/lib",
     "prepublish": "npm run -s build"
   },
@@ -59,6 +60,7 @@
     "@babel/cli": "^7.2.0",
     "@babel/core": "^7.2.0",
     "@babel/preset-env": "^7.2.0",
+    "@metarhia/doc": "^0.1.0",
     "eslint": "^5.10.0",
     "eslint-config-metarhia": "^6.1.0",
     "eslint-config-prettier": "^3.3.0",

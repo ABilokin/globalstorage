@@ -1,0 +1,23 @@
+{
+  "files": [
+    "lib/cursor.js",
+    "lib/provider.js",
+    "lib/fs.provider.js",
+    "lib/memory.provider.js",
+    "lib/pg.provider.js",
+    "lib/remote.provider.js"
+  ],
+  "customLinks": {
+    "pg.Pool": "https://github.com/brianc/node-pg-pool",
+    "pg.Client": "https://github.com/brianc/node-postgres",
+    "Uint64": "https://github.com/metarhia/common/blob/master/lib/uint64.js",
+    "Metaschema": "https://github.com/metarhia/metaschema/blob/master/lib/schema.js",
+    "StorageProvider": "https://github.com/metarhia/globalstorage/blob/master/lib/provider.js",
+    "Cursor": "https://github.com/metarhia/globalstorage/blob/master/lib/cursor.js",
+    "FsCursor": "https://github.com/metarhia/globalstorage/blob/master/lib/fs.cursor.js",
+    "MemoryCursor": "https://github.com/metarhia/globalstorage/blob/master/lib/memory.cursor.js",
+    "PostgresCursor": "https://github.com/metarhia/globalstorage/blob/master/lib/pg.cursor.js",
+    "RemoteCursor": "https://github.com/metarhia/globalstorage/blob/master/lib/remote.cursor.js"
+  },
+  "outputDir": "doc"
+}
